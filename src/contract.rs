@@ -12,6 +12,15 @@ pub const DEFAULT_LEASE_TTL_SECONDS: u64 = 300;
 /// Default post-swap warmup and health probe timeout in seconds (30 seconds).
 pub const DEFAULT_WARMUP_TIMEOUT_SECONDS: u64 = 30;
 
+/// Default canary bake SLO evaluation window in seconds (60 seconds).
+pub const DEFAULT_BAKE_WINDOW_SECONDS: u64 = 60;
+
+/// Default maximum error log count permitted during a canary bake window (0).
+pub const DEFAULT_MAX_ERROR_LOGS: u32 = 0;
+
+/// Default maximum p99 latency in milliseconds permitted during a canary bake window (250.0 ms).
+pub const DEFAULT_MAX_P99_LATENCY_MS: f64 = 250.0;
+
 fn default_lease_ttl() -> u64 {
     DEFAULT_LEASE_TTL_SECONDS
 }
@@ -20,8 +29,20 @@ fn default_warmup_timeout() -> u64 {
     DEFAULT_WARMUP_TIMEOUT_SECONDS
 }
 
+fn default_bake_window() -> u64 {
+    DEFAULT_BAKE_WINDOW_SECONDS
+}
+
+fn default_max_error_logs() -> u32 {
+    DEFAULT_MAX_ERROR_LOGS
+}
+
+fn default_max_p99_latency_ms() -> f64 {
+    DEFAULT_MAX_P99_LATENCY_MS
+}
+
 /// Declarative continuous delivery configuration loaded from `.muconde/MuConDe.yml`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MuConDeConfig {
     pub version: String,
     pub service: String,
@@ -30,6 +51,12 @@ pub struct MuConDeConfig {
     pub lease_ttl_seconds: u64,
     #[serde(default = "default_warmup_timeout")]
     pub warmup_timeout_seconds: u64,
+    #[serde(default = "default_bake_window")]
+    pub bake_window_seconds: u64,
+    #[serde(default = "default_max_error_logs")]
+    pub max_error_logs: u32,
+    #[serde(default = "default_max_p99_latency_ms")]
+    pub max_p99_latency_ms: f64,
     pub integration_tests: IntegrationTestSelector,
 }
 

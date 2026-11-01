@@ -13,6 +13,7 @@ use muconde_controller::orchestrator::{
     DeploymentOrchestrator, DeploymentOutcome, HttpMuRegistClient, IpcAgentClient,
     DEFAULT_REGISTRY_URL,
 };
+use muconde_controller::slo::MuObserveSloClient;
 use muconde_controller::tls::TlsConfig;
 
 #[tokio::main]
@@ -65,12 +66,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     let agent_client = Arc::new(IpcAgentClient::new(agent_port));
 
-    let orchestrator = Arc::new(DeploymentOrchestrator::new(
-        coordinator.clone(),
-        poller,
-        agent_client,
-        regist_client,
-    ));
+    let mut orchestrator =
+        DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client);
+
+    if let Ok(muobserve_addr) = std::env::var("MUOBSERVE_ADDR") {
+        let slo_client = Arc::new(MuObserveSloClient::new(muobserve_addr, tls_config.clone()));
+        orchestrator = orchestrator.with_slo_client(slo_client);
+    }
+
+    let orchestrator = Arc::new(orchestrator);
 
     // Spawn background lease expiration watcher (sweeping every 1s)
     let (revoke_tx, mut revoke_rx) = tokio::sync::mpsc::channel(64);

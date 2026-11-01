@@ -18,10 +18,12 @@ use muconde_ipc::{
     StageDeploymentRequest, StageDeploymentResponse, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK,
     MSG_TYPE_SLOT_SWAP, MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
+use muobserve_ipc::CanarySloAssertionRequest;
 
 use crate::contract::MuConDeConfig;
 use crate::error::{LeaseError, OrchestratorError};
 use crate::lease::{ClusterIdlePoller, LeaseCoordinator};
+use crate::slo::CanarySloClient;
 use crate::tls::TlsConfig;
 
 /// Default MuRegist server URL used across continuous delivery fabric.
@@ -416,6 +418,7 @@ pub struct DeploymentOrchestrator {
     poller: Option<ClusterIdlePoller>,
     agent_client: Arc<dyn AgentIpcClient>,
     regist_client: Arc<dyn MuRegistClient>,
+    slo_client: Option<Arc<dyn CanarySloClient>>,
     tainted_digests: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -432,8 +435,15 @@ impl DeploymentOrchestrator {
             poller,
             agent_client,
             regist_client,
+            slo_client: None,
             tainted_digests: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Attach a `CanarySloClient` (`MuObserveSloClient`) to gate canary promotion on `MuObserve` SLO verification.
+    pub fn with_slo_client(mut self, slo_client: Arc<dyn CanarySloClient>) -> Self {
+        self.slo_client = Some(slo_client);
+        self
     }
 
     /// Check whether an artifact digest is currently recorded as tainted
@@ -671,6 +681,55 @@ impl DeploymentOrchestrator {
                 .await;
         }
 
+        // Step 6b: Canary Bake SLO Verification via MuObserve (#12-#15)
+        if let Some(ref slo_client) = self.slo_client {
+            let slo_req = CanarySloAssertionRequest {
+                request_id: format!("slo-{deployment_id}"),
+                service_name: config.service.clone(),
+                candidate_digest: artifact_sha256.to_string(),
+                node_id: target_node.clone(),
+                bake_window_secs: config.bake_window_seconds,
+                max_error_logs: config.max_error_logs,
+                max_p99_latency_ms: config.max_p99_latency_ms,
+            };
+
+            match slo_client.verify_canary_slo(&slo_req).await {
+                Ok(slo_resp) => {
+                    if !slo_resp.healthy || slo_resp.taint_recommended {
+                        let reason = format!(
+                            "MuObserve canary SLO breach (healthy={}, taint_recommended={}, error_logs={}, p99_latency_ms={:.2}): {}",
+                            slo_resp.healthy,
+                            slo_resp.taint_recommended,
+                            slo_resp.error_log_count,
+                            slo_resp.p99_latency_ms,
+                            slo_resp.reason
+                        );
+                        return self
+                            .handle_failure_and_rollback(
+                                &grant,
+                                config,
+                                &target_node,
+                                artifact_sha256,
+                                &reason,
+                            )
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    let reason = format!("MuObserve canary SLO verification error: {e}");
+                    return self
+                        .handle_failure_and_rollback(
+                            &grant,
+                            config,
+                            &target_node,
+                            artifact_sha256,
+                            &reason,
+                        )
+                        .await;
+                }
+            }
+        }
+
         // Step 7: Success Path - Promotion to Slot A (#9)
         // Mark lease as promoted so background expiration sweeps do not trigger rollback
         let _ = self.lease_coordinator.mark_promoted(&grant.lease_id).await;
@@ -906,7 +965,50 @@ mod tests {
             target_nodes: vec!["worker-riscv64".into()],
             lease_ttl_seconds: 300,
             warmup_timeout_seconds: 30,
+            bake_window_seconds: 60,
+            max_error_logs: 0,
+            max_p99_latency_ms: 250.0,
             integration_tests: crate::contract::IntegrationTestSelector::All("all".into()),
+        }
+    }
+
+    struct MockSloClient {
+        pub healthy: AtomicBool,
+        pub taint_recommended: AtomicBool,
+        pub error_log_count: AtomicU32,
+        pub p99_latency_ms: Mutex<f64>,
+        pub reason: Mutex<String>,
+        pub slo_calls: AtomicU32,
+    }
+
+    impl Default for MockSloClient {
+        fn default() -> Self {
+            Self {
+                healthy: AtomicBool::new(true),
+                taint_recommended: AtomicBool::new(false),
+                error_log_count: AtomicU32::new(0),
+                p99_latency_ms: Mutex::new(35.0),
+                reason: Mutex::new("SLO within bounds".into()),
+                slo_calls: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CanarySloClient for MockSloClient {
+        async fn verify_canary_slo(
+            &self,
+            req: &CanarySloAssertionRequest,
+        ) -> Result<muobserve_ipc::CanarySloAssertionResponse, OrchestratorError> {
+            self.slo_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(muobserve_ipc::CanarySloAssertionResponse {
+                request_id: req.request_id.clone(),
+                healthy: self.healthy.load(Ordering::SeqCst),
+                error_log_count: self.error_log_count.load(Ordering::SeqCst),
+                p99_latency_ms: *self.p99_latency_ms.lock().await,
+                taint_recommended: self.taint_recommended.load(Ordering::SeqCst),
+                reason: self.reason.lock().await.clone(),
+            })
         }
     }
 
@@ -992,5 +1094,80 @@ mod tests {
 
         // Staging count should not have increased on the refused retry
         assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_slo_healthy_promotes_canary() {
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let slo = Arc::new(MockSloClient::default());
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_slo_client(slo.clone());
+
+        let config = sample_config();
+        let digest = "sha256-slo-healthy-123";
+
+        let outcome = orchestrator
+            .orchestrate_deployment(&config, digest, Some("dep-slo-ok".into()))
+            .await
+            .expect("deployment should succeed");
+
+        assert!(outcome.is_promoted());
+        assert_eq!(slo.slo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(regist.promote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(regist.taint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_slo_breach_triggers_rollback_and_taint() {
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+        let slo = Arc::new(MockSloClient {
+            healthy: AtomicBool::new(false),
+            taint_recommended: AtomicBool::new(true),
+            error_log_count: AtomicU32::new(4),
+            p99_latency_ms: Mutex::new(420.5),
+            reason: Mutex::new("error_log_count (4 > 0) and p99_latency_ms (420.5 > 250.0)".into()),
+            slo_calls: AtomicU32::new(0),
+        });
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone())
+                .with_slo_client(slo.clone());
+
+        let config = sample_config();
+        let digest = "sha256-slo-breach-999";
+
+        let outcome = orchestrator
+            .orchestrate_deployment(&config, digest, Some("dep-slo-breach".into()))
+            .await
+            .expect("orchestrator should return RolledBack outcome");
+
+        assert!(outcome.is_rolled_back());
+        assert_eq!(slo.slo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(regist.promote_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(regist.taint_calls.load(Ordering::SeqCst), 1);
+
+        let last_rb = agent.last_rollback_cmd.lock().await;
+        let rb = last_rb.as_ref().expect("rollback command dispatched");
+        assert_eq!(rb.restore_slot, DeploymentSlot::SlotA);
+        assert_eq!(rb.failed_artifact_sha256, digest);
+        assert!(rb.reason.contains("MuObserve canary SLO breach"));
     }
 }
