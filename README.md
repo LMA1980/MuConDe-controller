@@ -17,7 +17,7 @@
 
 Continuous Delivery (CD) control plane orchestrator managing zero-downtime, safe, autonomous deployment across cluster worker nodes over `MuConDe-ipc` and `rustls` mTLS (`step-ca` PKI).
 
-`MuConDe-controller` coordinates with `ActionRunner-controller` (`GET https://controller.ci.ci.internal:8443/api/cluster/nodes`), pulls verified artifacts from `MuRegist` (`https://registry.ci.ci.internal:8444`), and drives node-level `MuConDe-agent` daemons over `MuConDe-ipc`.
+`MuConDe-controller` coordinates with `ActionRunner-controller` (`GET https://controller.ci.internal:8443/api/cluster/nodes`), pulls verified artifacts from `MuRegist` (`https://registry.ci.internal:8444`), and drives node-level `MuConDe-agent` daemons over `MuConDe-ipc`.
 
 ---
 
