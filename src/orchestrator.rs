@@ -1,0 +1,996 @@
+//! Continuous delivery deployment state machine and orchestrator.
+//!
+//! Coordinates TTL-bounded leases, inactive slot staging, live health probes,
+//! atomic slot promotion, automatic rollback, and digest tainting.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+use muconde_ipc::{
+    create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification, DeploymentLeaseGrant,
+    DeploymentLeaseRequest, IntegrationTestReport, IpcHeader, RollbackCommand, SlotSwapCommand,
+    StageDeploymentRequest, StageDeploymentResponse, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK,
+    MSG_TYPE_SLOT_SWAP, MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
+};
+
+use crate::contract::MuConDeConfig;
+use crate::error::{LeaseError, OrchestratorError};
+use crate::lease::{ClusterIdlePoller, LeaseCoordinator};
+use crate::tls::TlsConfig;
+
+/// Default MuRegist server URL used across continuous delivery fabric.
+pub const DEFAULT_REGISTRY_URL: &str = "https://registry.ci.ci.internal:8444";
+
+/// Represents the terminal outcome of a continuous delivery deployment run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeploymentOutcome {
+    /// Candidate passed all health probes and integration tests, and was promoted to Slot A.
+    Promoted {
+        deployment_id: String,
+        service: String,
+        target_node: String,
+        artifact_sha256: String,
+    },
+    /// Deployment failed verification or timed out, and was atomically rolled back to Slot A.
+    RolledBack {
+        deployment_id: String,
+        service: String,
+        target_node: String,
+        artifact_sha256: String,
+        reason: String,
+    },
+}
+
+impl DeploymentOutcome {
+    /// Returns `true` if the candidate was successfully promoted to baseline Slot A.
+    pub fn is_promoted(&self) -> bool {
+        matches!(self, Self::Promoted { .. })
+    }
+
+    /// Returns `true` if the candidate was rolled back.
+    pub fn is_rolled_back(&self) -> bool {
+        matches!(self, Self::RolledBack { .. })
+    }
+}
+
+/// Abstract IPC client contract for communicating with node-level `MuConDe-agent`.
+#[async_trait]
+pub trait AgentIpcClient: Send + Sync {
+    /// Request the agent stage the candidate artifact into the designated slot subvolume.
+    async fn stage_deployment(
+        &self,
+        node_id: &str,
+        req: &StageDeploymentRequest,
+    ) -> Result<StageDeploymentResponse, OrchestratorError>;
+
+    /// Request the agent perform an atomic slot swap pointing to the candidate subvolume.
+    async fn slot_swap(
+        &self,
+        node_id: &str,
+        cmd: &SlotSwapCommand,
+    ) -> Result<(), OrchestratorError>;
+
+    /// Await or trigger integration test execution on the candidate slot.
+    async fn execute_integration_tests(
+        &self,
+        node_id: &str,
+        deployment_id: &str,
+        service: &str,
+        artifact_sha256: &str,
+        selected_tests: Option<&[String]>,
+        timeout: Duration,
+    ) -> Result<IntegrationTestReport, OrchestratorError>;
+
+    /// Dispatch RollbackCommand to restore baseline Slot A.
+    async fn rollback(&self, node_id: &str, cmd: &RollbackCommand)
+        -> Result<(), OrchestratorError>;
+}
+
+/// Abstract client contract for communicating with `MuRegist` canary management API.
+#[async_trait]
+pub trait MuRegistClient: Send + Sync {
+    /// Check whether an artifact digest has already been marked tainted in MuRegist.
+    async fn is_digest_tainted(&self, digest: &str) -> Result<bool, OrchestratorError>;
+
+    /// Mark canary release promoted and healthy in MuRegist (`POST /api/v1/canary/{digest}/promote`).
+    async fn promote_canary(&self, digest: &str) -> Result<(), OrchestratorError>;
+
+    /// Record tainted digest and rollback reason in MuRegist (`POST /api/v1/canary/{digest}/taint`).
+    async fn taint_canary(
+        &self,
+        digest: &str,
+        notification: &ArtifactTaintNotification,
+    ) -> Result<(), OrchestratorError>;
+}
+
+/// HTTP/mTLS client for MuRegist canary and bundle API.
+#[derive(Debug, Clone)]
+pub struct HttpMuRegistClient {
+    base_url: String,
+    client: Client,
+    auth_token: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TaintPayload {
+    pub service_name: Option<String>,
+    pub node_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl HttpMuRegistClient {
+    /// Initialize with base URL and mTLS configuration.
+    pub fn new(
+        base_url: impl Into<String>,
+        tls_config: &TlsConfig,
+        auth_token: Option<String>,
+    ) -> Result<Self, OrchestratorError> {
+        let client = tls_config
+            .build_reqwest_client()
+            .map_err(|e| OrchestratorError::Regist(e.to_string()))?;
+
+        Ok(Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client,
+            auth_token,
+        })
+    }
+
+    /// Initialize with an existing configured `reqwest::Client` (useful for mocks).
+    pub fn with_client(
+        base_url: impl Into<String>,
+        client: Client,
+        auth_token: Option<String>,
+    ) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client,
+            auth_token,
+        }
+    }
+}
+
+#[async_trait]
+impl MuRegistClient for HttpMuRegistClient {
+    async fn is_digest_tainted(&self, digest: &str) -> Result<bool, OrchestratorError> {
+        // Query canary status summary
+        let url = format!("{}/api/v1/canary/status", self.base_url);
+        let mut req = self.client.get(&url);
+        if let Some(ref token) = self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // If registry status endpoint is unreachable, fail safe or return false if testing
+                return Err(OrchestratorError::Regist(format!(
+                    "Failed to query canary status from {url}: {e}"
+                )));
+            }
+        };
+
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(status) = json.get("status").and_then(|s| s.as_str()) {
+                    if status == "tainted" {
+                        if let Some(active) =
+                            json.get("active_canary_digest").and_then(|d| d.as_str())
+                        {
+                            if active == digest {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn promote_canary(&self, digest: &str) -> Result<(), OrchestratorError> {
+        let url = format!("{}/api/v1/canary/{digest}/promote", self.base_url);
+        let mut req = self.client.post(&url);
+        if let Some(ref token) = self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            OrchestratorError::Regist(format!("Failed to send promote request to {url}: {e}"))
+        })?;
+
+        if resp.status().as_u16() == 409 {
+            return Err(OrchestratorError::ArtifactTainted(format!(
+                "Registry rejected promotion: digest '{digest}' is tainted"
+            )));
+        }
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::Regist(format!(
+                "Registry promotion for '{digest}' failed with status: {body}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn taint_canary(
+        &self,
+        digest: &str,
+        notification: &ArtifactTaintNotification,
+    ) -> Result<(), OrchestratorError> {
+        let url = format!("{}/api/v1/canary/{digest}/taint", self.base_url);
+        let payload = TaintPayload {
+            service_name: Some(notification.service_name.clone()),
+            node_id: None,
+            reason: Some(notification.reason.clone()),
+        };
+
+        let mut req = self.client.post(&url).json(&payload);
+        if let Some(ref token) = self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            OrchestratorError::Regist(format!("Failed to send taint request to {url}: {e}"))
+        })?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::Regist(format!(
+                "Registry taint for '{digest}' failed: {body}"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// Network implementation of `AgentIpcClient` communicating over TCP/TLS framing.
+#[derive(Debug, Clone)]
+pub struct IpcAgentClient {
+    port: u16,
+}
+
+impl IpcAgentClient {
+    /// Create client targeting agents listening on standard CD port.
+    pub fn new(port: u16) -> Self {
+        Self { port }
+    }
+}
+
+impl Default for IpcAgentClient {
+    fn default() -> Self {
+        Self::new(8446)
+    }
+}
+
+#[async_trait]
+impl AgentIpcClient for IpcAgentClient {
+    async fn stage_deployment(
+        &self,
+        node_id: &str,
+        req: &StageDeploymentRequest,
+    ) -> Result<StageDeploymentResponse, OrchestratorError> {
+        let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let addr = format!("{}:{}", node_id, self.port);
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
+            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+        })?;
+
+        let payload = fory
+            .serialize(req)
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let header = IpcHeader::new(MSG_TYPE_STAGE_DEPLOY_REQ, payload.len() as u32, 0, 1);
+
+        write_frame(&mut stream, &header, &payload)
+            .await
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+
+        let (resp_header, resp_payload) = read_frame(&mut stream)
+            .await
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+
+        if resp_header.msg_type != MSG_TYPE_STAGE_DEPLOY_RESP {
+            return Err(OrchestratorError::Agent(format!(
+                "Unexpected IPC frame type: {}",
+                resp_header.msg_type
+            )));
+        }
+
+        let resp: StageDeploymentResponse = fory
+            .deserialize(&resp_payload)
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+
+        Ok(resp)
+    }
+
+    async fn slot_swap(
+        &self,
+        node_id: &str,
+        cmd: &SlotSwapCommand,
+    ) -> Result<(), OrchestratorError> {
+        let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let addr = format!("{}:{}", node_id, self.port);
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
+            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+        })?;
+
+        let payload = fory
+            .serialize(cmd)
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let header = IpcHeader::new(MSG_TYPE_SLOT_SWAP, payload.len() as u32, 0, 1);
+
+        write_frame(&mut stream, &header, &payload)
+            .await
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn execute_integration_tests(
+        &self,
+        node_id: &str,
+        deployment_id: &str,
+        service: &str,
+        artifact_sha256: &str,
+        selected_tests: Option<&[String]>,
+        timeout: Duration,
+    ) -> Result<IntegrationTestReport, OrchestratorError> {
+        let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let addr = format!("{}:{}", node_id, self.port);
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
+            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+        })?;
+
+        let executed = match selected_tests {
+            Some(tests) => tests.to_vec(),
+            None => vec!["all".to_string()],
+        };
+
+        // Await IntegrationTestReport frame within timeout
+        let read_future = async {
+            loop {
+                let (header, payload) = read_frame(&mut stream)
+                    .await
+                    .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+                if header.msg_type == MSG_TYPE_IT_REPORT {
+                    let report: IntegrationTestReport = fory
+                        .deserialize(&payload)
+                        .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+                    return Ok(report);
+                }
+            }
+        };
+
+        match tokio::time::timeout(timeout, read_future).await {
+            Ok(res) => res,
+            Err(_) => Ok(IntegrationTestReport {
+                deployment_id: deployment_id.to_string(),
+                service_name: service.to_string(),
+                artifact_sha256: artifact_sha256.to_string(),
+                executed_tests: executed,
+                passed: false,
+                failed_tests: vec!["timeout".to_string()],
+                duration_ms: timeout.as_millis() as u64,
+                log_excerpt: Some("Integration test execution timed out".to_string()),
+            }),
+        }
+    }
+
+    async fn rollback(
+        &self,
+        node_id: &str,
+        cmd: &RollbackCommand,
+    ) -> Result<(), OrchestratorError> {
+        let fory = create_fory_runtime().map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let addr = format!("{}:{}", node_id, self.port);
+        let mut stream = tokio::net::TcpStream::connect(&addr).await.map_err(|e| {
+            OrchestratorError::Agent(format!("Connect to agent {addr} failed: {e}"))
+        })?;
+
+        let payload = fory
+            .serialize(cmd)
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+        let header = IpcHeader::new(MSG_TYPE_ROLLBACK, payload.len() as u32, 0, 1);
+
+        write_frame(&mut stream, &header, &payload)
+            .await
+            .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// Orchestrator driving continuous delivery deployments across cluster nodes.
+pub struct DeploymentOrchestrator {
+    lease_coordinator: Arc<LeaseCoordinator>,
+    poller: Option<ClusterIdlePoller>,
+    agent_client: Arc<dyn AgentIpcClient>,
+    regist_client: Arc<dyn MuRegistClient>,
+    tainted_digests: Arc<RwLock<HashSet<String>>>,
+}
+
+impl DeploymentOrchestrator {
+    /// Create a new `DeploymentOrchestrator` with specified dependencies.
+    pub fn new(
+        lease_coordinator: Arc<LeaseCoordinator>,
+        poller: Option<ClusterIdlePoller>,
+        agent_client: Arc<dyn AgentIpcClient>,
+        regist_client: Arc<dyn MuRegistClient>,
+    ) -> Self {
+        Self {
+            lease_coordinator,
+            poller,
+            agent_client,
+            regist_client,
+            tainted_digests: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    /// Check whether an artifact digest is currently recorded as tainted
+    /// either locally or in MuRegist.
+    pub async fn is_digest_tainted(&self, digest: &str) -> Result<bool, OrchestratorError> {
+        {
+            let local_taints = self.tainted_digests.read().await;
+            if local_taints.contains(digest) {
+                return Ok(true);
+            }
+        }
+
+        self.regist_client.is_digest_tainted(digest).await
+    }
+
+    /// Mark an artifact digest tainted locally.
+    pub async fn mark_local_tainted(&self, digest: impl Into<String>) {
+        let mut local_taints = self.tainted_digests.write().await;
+        local_taints.insert(digest.into());
+    }
+
+    /// Discover and select the first eligible idle target node from the configured list.
+    pub async fn select_idle_target_node(
+        &self,
+        target_nodes: &[String],
+    ) -> Result<String, OrchestratorError> {
+        if let Some(ref poller) = self.poller {
+            let nodes = poller
+                .fetch_nodes()
+                .await
+                .map_err(OrchestratorError::Lease)?;
+
+            for target in target_nodes {
+                if let Some(node) = nodes.iter().find(|n| &n.node_id == target) {
+                    if node.is_idle_for_deployment() {
+                        return Ok(target.clone());
+                    }
+                }
+            }
+
+            Err(OrchestratorError::Lease(LeaseError::NodeNotIdle(format!(
+                "None of the target nodes {:?} are currently idle and eligible",
+                target_nodes
+            ))))
+        } else if let Some(first) = target_nodes.first() {
+            // When poller is not provided (standalone/test), use first target node
+            Ok(first.clone())
+        } else {
+            Err(OrchestratorError::Lease(LeaseError::Internal(
+                "No target nodes specified".into(),
+            )))
+        }
+    }
+
+    /// Orchestrate complete deployment workflow for a candidate artifact.
+    ///
+    /// Steps:
+    /// 1. Verifies candidate digest is NOT tainted; refuses deployment immediately if tainted.
+    /// 2. Discovers idle target worker node.
+    /// 3. Acquires TTL-bounded deployment lease from `LeaseCoordinator`.
+    /// 4. Instructs `MuConDe-agent` to stage candidate into Slot B (`@b`).
+    /// 5. Dispatches `SlotSwapCommand` to swap pointer to Slot B.
+    /// 6. Awaits live integration test and health verification.
+    /// 7. **Success Path**: Promotes candidate, calls `POST /api/v1/canary/{digest}/promote` on MuRegist,
+    ///    releases deployment lease, and returns `DeploymentOutcome::Promoted`.
+    /// 8. **Failure Path**: Immediately dispatches `RollbackCommand` to Slot A, records digest in taint set,
+    ///    calls `POST /api/v1/canary/{digest}/taint` on MuRegist, releases lease, and returns `DeploymentOutcome::RolledBack`.
+    pub async fn orchestrate_deployment(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        custom_deployment_id: Option<String>,
+    ) -> Result<DeploymentOutcome, OrchestratorError> {
+        // Step 1: Enforce Digest Tainting Pre-check (#10)
+        if self.is_digest_tainted(artifact_sha256).await? {
+            return Err(OrchestratorError::ArtifactTainted(
+                artifact_sha256.to_string(),
+            ));
+        }
+
+        // Validate declarative contract
+        config.validate()?;
+
+        // Step 2: Select idle target worker node (#4)
+        let target_node = self.select_idle_target_node(&config.target_nodes).await?;
+
+        // Step 3: Acquire TTL deployment lease (#5)
+        let deployment_id =
+            custom_deployment_id.unwrap_or_else(|| format!("dep-{}", uuid::Uuid::new_v4()));
+
+        let lease_req = DeploymentLeaseRequest {
+            deployment_id: deployment_id.clone(),
+            node_id: target_node.clone(),
+            service_name: config.service.clone(),
+            artifact_sha256: artifact_sha256.to_string(),
+            requested_ttl_secs: config.lease_ttl_seconds,
+        };
+
+        let grant = self.lease_coordinator.acquire_lease(&lease_req).await;
+        if !grant.granted {
+            let reason = grant
+                .denial_reason
+                .unwrap_or_else(|| "Deployment lease denied".to_string());
+            return Err(OrchestratorError::Lease(LeaseError::Internal(reason)));
+        }
+
+        // Step 4: Instruct agent to stage deployment bundle into candidate slot (@b)
+        let stage_req = StageDeploymentRequest {
+            deployment_id: deployment_id.clone(),
+            lease_id: grant.lease_id.clone(),
+            service_name: config.service.clone(),
+            artifact_sha256: artifact_sha256.to_string(),
+            target_slot: grant.candidate_slot,
+        };
+
+        let stage_result = self
+            .agent_client
+            .stage_deployment(&target_node, &stage_req)
+            .await;
+
+        let stage_ok = match stage_result {
+            Ok(ref resp) if resp.staged_ok => true,
+            Ok(ref resp) => {
+                let err_msg = resp
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Staging refused by agent".to_string());
+                return self
+                    .handle_failure_and_rollback(
+                        &grant,
+                        config,
+                        &target_node,
+                        artifact_sha256,
+                        &format!("Staging failed: {err_msg}"),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                return self
+                    .handle_failure_and_rollback(
+                        &grant,
+                        config,
+                        &target_node,
+                        artifact_sha256,
+                        &format!("Agent stage IPC error: {e}"),
+                    )
+                    .await;
+            }
+        };
+
+        if !stage_ok {
+            return self
+                .handle_failure_and_rollback(
+                    &grant,
+                    config,
+                    &target_node,
+                    artifact_sha256,
+                    "Staging verification failed",
+                )
+                .await;
+        }
+
+        // Step 5: Instruct agent to perform atomic slot swap to Slot B
+        let swap_cmd = SlotSwapCommand {
+            deployment_id: deployment_id.clone(),
+            lease_id: grant.lease_id.clone(),
+            service_name: config.service.clone(),
+            from_slot: grant.active_slot,
+            to_slot: grant.candidate_slot,
+            systemd_unit: format!("{}.service", config.service),
+            warmup_timeout_secs: config.warmup_timeout_seconds,
+        };
+
+        if let Err(e) = self.agent_client.slot_swap(&target_node, &swap_cmd).await {
+            return self
+                .handle_failure_and_rollback(
+                    &grant,
+                    config,
+                    &target_node,
+                    artifact_sha256,
+                    &format!("Atomic slot swap failed: {e}"),
+                )
+                .await;
+        }
+
+        // Step 6: Await integration test execution and health watchdog
+        let it_timeout = Duration::from_secs(config.warmup_timeout_seconds);
+        let it_result = self
+            .agent_client
+            .execute_integration_tests(
+                &target_node,
+                &deployment_id,
+                &config.service,
+                artifact_sha256,
+                config.selected_tests(),
+                it_timeout,
+            )
+            .await;
+
+        let report = match it_result {
+            Ok(r) => r,
+            Err(e) => {
+                return self
+                    .handle_failure_and_rollback(
+                        &grant,
+                        config,
+                        &target_node,
+                        artifact_sha256,
+                        &format!("Integration test communication failure: {e}"),
+                    )
+                    .await;
+            }
+        };
+
+        // Check verification outcome
+        let now_ms = LeaseCoordinator::current_epoch_ms();
+        let lease_expired = now_ms >= grant.expires_at_epoch_ms;
+
+        if lease_expired {
+            return self
+                .handle_failure_and_rollback(
+                    &grant,
+                    config,
+                    &target_node,
+                    artifact_sha256,
+                    "Lease TTL expired before integration tests completed",
+                )
+                .await;
+        }
+
+        if !report.passed || !report.failed_tests.is_empty() {
+            let reason = format!("Integration tests failed: {:?}", report.failed_tests);
+            return self
+                .handle_failure_and_rollback(&grant, config, &target_node, artifact_sha256, &reason)
+                .await;
+        }
+
+        // Step 7: Success Path - Promotion to Slot A (#9)
+        // Mark lease as promoted so background expiration sweeps do not trigger rollback
+        let _ = self.lease_coordinator.mark_promoted(&grant.lease_id).await;
+
+        // Notify MuRegist of canary promotion
+        if let Err(e) = self.regist_client.promote_canary(artifact_sha256).await {
+            tracing::error!(
+                digest = %artifact_sha256,
+                error = %e,
+                "MuRegist promotion failed"
+            );
+        }
+
+        // Release deployment lease
+        let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
+
+        Ok(DeploymentOutcome::Promoted {
+            deployment_id,
+            service: config.service.clone(),
+            target_node,
+            artifact_sha256: artifact_sha256.to_string(),
+        })
+    }
+
+    /// Handles failure, lease expiration, or IT regression by triggering atomic rollback
+    /// and digest tainting (#9, #10).
+    async fn handle_failure_and_rollback(
+        &self,
+        grant: &DeploymentLeaseGrant,
+        config: &MuConDeConfig,
+        target_node: &str,
+        artifact_sha256: &str,
+        reason: &str,
+    ) -> Result<DeploymentOutcome, OrchestratorError> {
+        tracing::warn!(
+            deployment_id = %grant.deployment_id,
+            service = %config.service,
+            node = %target_node,
+            digest = %artifact_sha256,
+            reason = %reason,
+            "Deployment failed verification; initiating rollback and digest taint"
+        );
+
+        // 1. Dispatch immediate RollbackCommand to restore Slot A
+        let rollback_cmd = RollbackCommand {
+            deployment_id: grant.deployment_id.clone(),
+            lease_id: grant.lease_id.clone(),
+            service_name: config.service.clone(),
+            restore_slot: grant.active_slot,
+            failed_artifact_sha256: artifact_sha256.to_string(),
+            reason: reason.to_string(),
+        };
+
+        if let Err(e) = self.agent_client.rollback(target_node, &rollback_cmd).await {
+            tracing::error!(
+                node = %target_node,
+                error = %e,
+                "Failed to dispatch rollback command to agent"
+            );
+        }
+
+        // 2. Record digest locally in taint set (#10)
+        self.mark_local_tainted(artifact_sha256).await;
+
+        // 3. Notify MuRegist of tainted digest (#10)
+        let taint_notification = ArtifactTaintNotification {
+            deployment_id: grant.deployment_id.clone(),
+            service_name: config.service.clone(),
+            artifact_sha256: artifact_sha256.to_string(),
+            tainted_at_epoch_ms: LeaseCoordinator::current_epoch_ms(),
+            reason: reason.to_string(),
+            rollback_completed: true,
+        };
+
+        if let Err(e) = self
+            .regist_client
+            .taint_canary(artifact_sha256, &taint_notification)
+            .await
+        {
+            tracing::error!(
+                digest = %artifact_sha256,
+                error = %e,
+                "Failed to send taint notification to MuRegist"
+            );
+        }
+
+        // 4. Clean up lease in LeaseCoordinator
+        let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
+
+        Ok(DeploymentOutcome::RolledBack {
+            deployment_id: grant.deployment_id.clone(),
+            service: config.service.clone(),
+            target_node: target_node.to_string(),
+            artifact_sha256: artifact_sha256.to_string(),
+            reason: reason.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muconde_ipc::DeploymentSlot;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use tokio::sync::Mutex;
+
+    // Mock implementation of AgentIpcClient
+    #[derive(Default)]
+    struct MockAgentClient {
+        pub stage_ok: AtomicBool,
+        pub stage_calls: AtomicU32,
+        pub swap_ok: AtomicBool,
+        pub swap_calls: AtomicU32,
+        pub it_passed: AtomicBool,
+        pub it_failed_tests: Mutex<Vec<String>>,
+        pub rollback_calls: AtomicU32,
+        pub last_rollback_cmd: Mutex<Option<RollbackCommand>>,
+    }
+
+    #[async_trait]
+    impl AgentIpcClient for MockAgentClient {
+        async fn stage_deployment(
+            &self,
+            _node_id: &str,
+            req: &StageDeploymentRequest,
+        ) -> Result<StageDeploymentResponse, OrchestratorError> {
+            self.stage_calls.fetch_add(1, Ordering::SeqCst);
+            let ok = self.stage_ok.load(Ordering::SeqCst);
+            Ok(StageDeploymentResponse {
+                deployment_id: req.deployment_id.clone(),
+                target_slot: req.target_slot,
+                btrfs_subvolume_path: "/srv/muconde/slots/slot-b".into(),
+                staged_ok: ok,
+                error_message: if ok {
+                    None
+                } else {
+                    Some("Staging simulated failure".into())
+                },
+            })
+        }
+
+        async fn slot_swap(
+            &self,
+            _node_id: &str,
+            _cmd: &SlotSwapCommand,
+        ) -> Result<(), OrchestratorError> {
+            self.swap_calls.fetch_add(1, Ordering::SeqCst);
+            if self.swap_ok.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(OrchestratorError::Agent("Swap simulated failure".into()))
+            }
+        }
+
+        async fn execute_integration_tests(
+            &self,
+            _node_id: &str,
+            deployment_id: &str,
+            service: &str,
+            artifact_sha256: &str,
+            _selected_tests: Option<&[String]>,
+            _timeout: Duration,
+        ) -> Result<IntegrationTestReport, OrchestratorError> {
+            let passed = self.it_passed.load(Ordering::SeqCst);
+            let failed = self.it_failed_tests.lock().await.clone();
+            Ok(IntegrationTestReport {
+                deployment_id: deployment_id.to_string(),
+                service_name: service.to_string(),
+                artifact_sha256: artifact_sha256.to_string(),
+                executed_tests: vec!["it_smoke".into()],
+                passed,
+                failed_tests: failed,
+                duration_ms: 100,
+                log_excerpt: None,
+            })
+        }
+
+        async fn rollback(
+            &self,
+            _node_id: &str,
+            cmd: &RollbackCommand,
+        ) -> Result<(), OrchestratorError> {
+            self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+            let mut last = self.last_rollback_cmd.lock().await;
+            *last = Some(cmd.clone());
+            Ok(())
+        }
+    }
+
+    // Mock implementation of MuRegistClient
+    #[derive(Default)]
+    struct MockMuRegistClient {
+        pub tainted_digests: Mutex<HashSet<String>>,
+        pub promote_calls: AtomicU32,
+        pub taint_calls: AtomicU32,
+        pub last_taint: Mutex<Option<(String, ArtifactTaintNotification)>>,
+    }
+
+    #[async_trait]
+    impl MuRegistClient for MockMuRegistClient {
+        async fn is_digest_tainted(&self, digest: &str) -> Result<bool, OrchestratorError> {
+            let taints = self.tainted_digests.lock().await;
+            Ok(taints.contains(digest))
+        }
+
+        async fn promote_canary(&self, digest: &str) -> Result<(), OrchestratorError> {
+            let taints = self.tainted_digests.lock().await;
+            if taints.contains(digest) {
+                return Err(OrchestratorError::ArtifactTainted(digest.to_string()));
+            }
+            self.promote_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn taint_canary(
+            &self,
+            digest: &str,
+            notification: &ArtifactTaintNotification,
+        ) -> Result<(), OrchestratorError> {
+            self.taint_calls.fetch_add(1, Ordering::SeqCst);
+            let mut taints = self.tainted_digests.lock().await;
+            taints.insert(digest.to_string());
+            let mut last = self.last_taint.lock().await;
+            *last = Some((digest.to_string(), notification.clone()));
+            Ok(())
+        }
+    }
+
+    fn sample_config() -> MuConDeConfig {
+        MuConDeConfig {
+            version: "1".into(),
+            service: "action-runner".into(),
+            target_nodes: vec!["worker-riscv64".into()],
+            lease_ttl_seconds: 300,
+            warmup_timeout_seconds: 30,
+            integration_tests: crate::contract::IntegrationTestSelector::All("all".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_full_success_path() {
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone());
+
+        let config = sample_config();
+        let digest = "sha256-success-123";
+
+        let outcome = orchestrator
+            .orchestrate_deployment(&config, digest, Some("dep-success".into()))
+            .await
+            .expect("deployment should succeed");
+
+        assert!(outcome.is_promoted());
+        assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.swap_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(regist.promote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(regist.taint_calls.load(Ordering::SeqCst), 0);
+
+        // Verify lease was released
+        let active_leases = coordinator.sweep_expired_leases().await;
+        assert!(active_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_it_failure_triggers_rollback_and_taint() {
+        let coordinator = Arc::new(LeaseCoordinator::new());
+        let agent = Arc::new(MockAgentClient {
+            stage_ok: AtomicBool::new(true),
+            swap_ok: AtomicBool::new(true),
+            it_passed: AtomicBool::new(false),
+            it_failed_tests: Mutex::new(vec!["it_smoke".into()]),
+            ..Default::default()
+        });
+        let regist = Arc::new(MockMuRegistClient::default());
+
+        let orchestrator =
+            DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist.clone());
+
+        let config = sample_config();
+        let digest = "sha256-it-fail-123";
+
+        let outcome = orchestrator
+            .orchestrate_deployment(&config, digest, Some("dep-it-fail".into()))
+            .await
+            .expect("orchestrator should return outcome");
+
+        assert!(outcome.is_rolled_back());
+        assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.swap_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(regist.promote_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(regist.taint_calls.load(Ordering::SeqCst), 1);
+
+        // Verify rollback command details
+        let last_rb = agent.last_rollback_cmd.lock().await;
+        let rb = last_rb.as_ref().expect("rollback command was dispatched");
+        assert_eq!(rb.restore_slot, DeploymentSlot::SlotA);
+        assert_eq!(rb.failed_artifact_sha256, digest);
+
+        // Subsequent deployment attempt of the tainted digest MUST be refused pre-lease
+        let retry_outcome = orchestrator
+            .orchestrate_deployment(&config, digest, Some("dep-retry".into()))
+            .await;
+
+        match retry_outcome {
+            Err(OrchestratorError::ArtifactTainted(d)) => assert_eq!(d, digest),
+            other => panic!("Expected ArtifactTainted error, got: {:?}", other),
+        }
+
+        // Staging count should not have increased on the refused retry
+        assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 1);
+    }
+}
