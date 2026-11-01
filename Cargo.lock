@@ -1150,6 +1150,8 @@ dependencies = [
  "async-trait",
  "axum",
  "fory",
+ "futures-util",
+ "http-body-util",
  "muconde-ipc",
  "muobserve-ipc",
  "rcgen",
@@ -1159,10 +1161,12 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1171,8 +1175,8 @@ dependencies = [
 
 [[package]]
 name = "muconde-ipc"
-version = "0.1.0"
-source = "git+https://github.com/LMA1980/MuConDe-ipc.git?branch=main#057b38c6dac13cf1a1c2fae63220f8cc9451346e"
+version = "0.2.0"
+source = "git+https://github.com/LMA1980/MuConDe-ipc.git?branch=feat%2Fintegration-test-progress#6c46b25867f5b08fb6f96d88a7e7649016fba960"
 dependencies = [
  "bytes",
  "fory",

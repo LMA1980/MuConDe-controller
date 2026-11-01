@@ -14,12 +14,16 @@ use tokio::sync::RwLock;
 
 use muconde_ipc::{
     create_fory_runtime, read_frame, write_frame, ArtifactTaintNotification, DeploymentLeaseGrant,
-    DeploymentLeaseRequest, IntegrationTestReport, IpcHeader, RollbackCommand, SlotSwapCommand,
-    StageDeploymentRequest, StageDeploymentResponse, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK,
-    MSG_TYPE_SLOT_SWAP, MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
+    DeploymentLeaseRequest, IntegrationTestProgress, IntegrationTestReport, IpcHeader,
+    RollbackCommand, SlotSwapCommand, StageDeploymentRequest, StageDeploymentResponse,
+    MSG_TYPE_IT_PROGRESS, MSG_TYPE_IT_REPORT, MSG_TYPE_ROLLBACK, MSG_TYPE_SLOT_SWAP,
+    MSG_TYPE_STAGE_DEPLOY_REQ, MSG_TYPE_STAGE_DEPLOY_RESP,
 };
 use muobserve_ipc::CanarySloAssertionRequest;
 
+use crate::cd_state::{
+    classify_rollback_reason, CdStateStore, DeploymentStart, ItProgressSink, Slot,
+};
 use crate::contract::MuConDeConfig;
 use crate::error::{LeaseError, OrchestratorError};
 use crate::lease::{ClusterIdlePoller, LeaseCoordinator};
@@ -256,16 +260,81 @@ impl MuRegistClient for HttpMuRegistClient {
     }
 }
 
+/// Result of dispatching one agent frame while awaiting the integration-test verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentFrame {
+    /// The final aggregate verdict.
+    Report(IntegrationTestReport),
+    /// A per-test progress update (already forwarded to the sink, if any).
+    Progress(IntegrationTestProgress),
+    /// Any other or unknown message type; skipped without decoding the payload.
+    Ignored(u16),
+}
+
+/// Dispatches one frame read from an agent while the integration gate runs.
+///
+/// Dispatch happens on `msg_type` before decoding, so unknown message IDs are skipped
+/// safely. A progress payload that fails to decode is logged and ignored (progress is
+/// advisory); a report that fails to decode is an error.
+pub fn dispatch_agent_frame(
+    fory: &fory::Fory,
+    msg_type: u16,
+    payload: &[u8],
+    sink: Option<&dyn ItProgressSink>,
+) -> Result<AgentFrame, OrchestratorError> {
+    match msg_type {
+        MSG_TYPE_IT_REPORT => {
+            let report: IntegrationTestReport = fory
+                .deserialize(payload)
+                .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+            Ok(AgentFrame::Report(report))
+        }
+        MSG_TYPE_IT_PROGRESS => match fory.deserialize::<IntegrationTestProgress>(payload) {
+            Ok(p) => {
+                if let Some(sink) = sink {
+                    sink.on_it_progress(&p);
+                }
+                Ok(AgentFrame::Progress(p))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Ignoring undecodable IntegrationTestProgress frame");
+                Ok(AgentFrame::Ignored(msg_type))
+            }
+        },
+        other => Ok(AgentFrame::Ignored(other)),
+    }
+}
+
 /// Network implementation of `AgentIpcClient` communicating over TCP/TLS framing.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IpcAgentClient {
     port: u16,
+    progress_sink: Option<Arc<dyn ItProgressSink>>,
+}
+
+impl std::fmt::Debug for IpcAgentClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IpcAgentClient")
+            .field("port", &self.port)
+            .field("progress_sink", &self.progress_sink.is_some())
+            .finish()
+    }
 }
 
 impl IpcAgentClient {
     /// Create client targeting agents listening on standard CD port.
     pub fn new(port: u16) -> Self {
-        Self { port }
+        Self {
+            port,
+            progress_sink: None,
+        }
+    }
+
+    /// Forward `IntegrationTestProgress` frames to `sink` (e.g. the CD API state store).
+    #[must_use]
+    pub fn with_progress_sink(mut self, sink: Arc<dyn ItProgressSink>) -> Self {
+        self.progress_sink = Some(sink);
+        self
     }
 }
 
@@ -364,10 +433,12 @@ impl AgentIpcClient for IpcAgentClient {
                 let (header, payload) = read_frame(&mut stream)
                     .await
                     .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
-                if header.msg_type == MSG_TYPE_IT_REPORT {
-                    let report: IntegrationTestReport = fory
-                        .deserialize(&payload)
-                        .map_err(|e| OrchestratorError::Agent(e.to_string()))?;
+                if let AgentFrame::Report(report) = dispatch_agent_frame(
+                    &fory,
+                    header.msg_type,
+                    &payload,
+                    self.progress_sink.as_deref(),
+                )? {
                     return Ok(report);
                 }
             }
@@ -420,6 +491,7 @@ pub struct DeploymentOrchestrator {
     regist_client: Arc<dyn MuRegistClient>,
     slo_client: Option<Arc<dyn CanarySloClient>>,
     tainted_digests: Arc<RwLock<HashSet<String>>>,
+    cd_state: Option<Arc<CdStateStore>>,
 }
 
 impl DeploymentOrchestrator {
@@ -437,6 +509,19 @@ impl DeploymentOrchestrator {
             regist_client,
             slo_client: None,
             tainted_digests: Arc::new(RwLock::new(HashSet::new())),
+            cd_state: None,
+        }
+    }
+
+    /// Publish deployment, gate, lease and outcome changes to the read-only CD API state.
+    pub fn with_cd_state(mut self, cd_state: Arc<CdStateStore>) -> Self {
+        self.cd_state = Some(cd_state);
+        self
+    }
+
+    async fn sync_leases(&self) {
+        if let Some(ref store) = self.cd_state {
+            store.set_leases(self.lease_coordinator.list_leases().await);
         }
     }
 
@@ -517,6 +602,19 @@ impl DeploymentOrchestrator {
         artifact_sha256: &str,
         custom_deployment_id: Option<String>,
     ) -> Result<DeploymentOutcome, OrchestratorError> {
+        self.orchestrate_deployment_for_repo(config, artifact_sha256, custom_deployment_id, None)
+            .await
+    }
+
+    /// Same as [`Self::orchestrate_deployment`], recording `repo` (`owner/repo`) for the
+    /// CD API's `?repo=` filter.
+    pub async fn orchestrate_deployment_for_repo(
+        &self,
+        config: &MuConDeConfig,
+        artifact_sha256: &str,
+        custom_deployment_id: Option<String>,
+        repo: Option<&str>,
+    ) -> Result<DeploymentOutcome, OrchestratorError> {
         // Step 1: Enforce Digest Tainting Pre-check (#10)
         if self.is_digest_tainted(artifact_sha256).await? {
             return Err(OrchestratorError::ArtifactTainted(
@@ -549,6 +647,24 @@ impl DeploymentOrchestrator {
                 .unwrap_or_else(|| "Deployment lease denied".to_string());
             return Err(OrchestratorError::Lease(LeaseError::Internal(reason)));
         }
+
+        if let Some(ref store) = self.cd_state {
+            // Contract test list in order; "all" is expanded by the agent's Pending frames.
+            // The contract has no per-test criticality, so every contract test is critical.
+            let tests = config
+                .selected_tests()
+                .map(|t| t.iter().map(|n| (n.clone(), true)).collect())
+                .unwrap_or_default();
+            store.deployment_started(DeploymentStart::from_grant(
+                &grant,
+                repo.map(str::to_string),
+                &config.service,
+                artifact_sha256,
+                &target_node,
+                tests,
+            ));
+        }
+        self.sync_leases().await;
 
         // Step 4: Instruct agent to stage deployment bundle into candidate slot (@b)
         let stage_req = StageDeploymentRequest {
@@ -644,7 +760,12 @@ impl DeploymentOrchestrator {
             .await;
 
         let report = match it_result {
-            Ok(r) => r,
+            Ok(r) => {
+                if let Some(ref store) = self.cd_state {
+                    store.apply_it_report(&r);
+                }
+                r
+            }
             Err(e) => {
                 return self
                     .handle_failure_and_rollback(
@@ -746,6 +867,11 @@ impl DeploymentOrchestrator {
         // Release deployment lease
         let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
 
+        if let Some(ref store) = self.cd_state {
+            store.deployment_promoted(&deployment_id, Slot::from(grant.candidate_slot));
+        }
+        self.sync_leases().await;
+
         Ok(DeploymentOutcome::Promoted {
             deployment_id,
             service: config.service.clone(),
@@ -818,6 +944,17 @@ impl DeploymentOrchestrator {
 
         // 4. Clean up lease in LeaseCoordinator
         let _ = self.lease_coordinator.release_lease(&grant.lease_id).await;
+
+        if let Some(ref store) = self.cd_state {
+            store.deployment_rolled_back(
+                &grant.deployment_id,
+                Slot::from(grant.active_slot),
+                classify_rollback_reason(reason),
+                reason,
+            );
+            store.deployment_tainted(&grant.deployment_id, artifact_sha256, reason);
+        }
+        self.sync_leases().await;
 
         Ok(DeploymentOutcome::RolledBack {
             deployment_id: grant.deployment_id.clone(),
