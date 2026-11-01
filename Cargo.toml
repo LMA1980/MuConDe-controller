@@ -7,7 +7,9 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/LMA1980/MuConDe-controller"
 
 [dependencies]
-muconde-ipc = { git = "https://github.com/LMA1980/MuConDe-ipc.git", branch = "main" }
+# TEMPORARY: pinned to the ipc feature branch until LMA1980/MuConDe-ipc#21 merges.
+# Switch back to `branch = "main"` and run `cargo update -p muconde-ipc` afterwards.
+muconde-ipc = { git = "https://github.com/LMA1980/MuConDe-ipc.git", branch = "feat/integration-test-progress" }
 muobserve-ipc = { git = "https://github.com/LMA1980/MuObserve-ipc.git" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "process", "net", "signal"] }
 tokio-rustls = "0.26"
@@ -24,8 +26,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { version = "0.8" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+subtle = "2"
 
 [dev-dependencies]
-axum = { version = "0.8" }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 rcgen = "0.14"
 tempfile = "3"

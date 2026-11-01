@@ -7,6 +7,8 @@ use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+use muconde_controller::api::{spawn_cd_api, CdApiConfig};
+use muconde_controller::cd_state::CdStateStore;
 use muconde_controller::contract::MuConDeConfig;
 use muconde_controller::lease::{ClusterIdlePoller, LeaseCoordinator, DEFAULT_CONTROLLER_URL};
 use muconde_controller::orchestrator::{
@@ -64,10 +66,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &tls_config,
         auth_token,
     )?);
-    let agent_client = Arc::new(IpcAgentClient::new(agent_port));
+    // Read-only CD state shared by the orchestrator, lease watcher, agent IPC reader and the
+    // optional `/api/cd/*` listener.
+    let cd_state = Arc::new(CdStateStore::default());
+
+    let agent_client =
+        Arc::new(IpcAgentClient::new(agent_port).with_progress_sink(cd_state.clone()));
 
     let mut orchestrator =
-        DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client);
+        DeploymentOrchestrator::new(coordinator.clone(), poller, agent_client, regist_client)
+            .with_cd_state(cd_state.clone());
 
     if let Ok(muobserve_addr) = std::env::var("MUOBSERVE_ADDR") {
         let slo_client = Arc::new(MuObserveSloClient::new(muobserve_addr, tls_config.clone()));
@@ -82,8 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .spawn_expiration_watcher(Duration::from_secs(1), revoke_tx);
 
+    let sweep_state = cd_state.clone();
     tokio::spawn(async move {
         while let Some((revoke, rollback)) = revoke_rx.recv().await {
+            sweep_state.lease_expired(&revoke.deployment_id, &revoke.lease_id);
             info!(
                 deployment_id = %revoke.deployment_id,
                 lease_id = %revoke.lease_id,
@@ -93,6 +103,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     });
+
+    // Mirror the lease table into the CD API snapshot (TTL countdowns, expiries).
+    {
+        let mirror_state = cd_state.clone();
+        let mirror_coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                mirror_state.set_leases(mirror_coordinator.list_leases().await);
+            }
+        });
+    }
+
+    // Optional read-only CD status API on a separate listener (disabled unless
+    // MUCONDE_CD_API_ADDR is set; bearer token from MUCONDE_CD_API_TOKEN_FILE).
+    let cd_api_config = CdApiConfig::from_env();
+    let _cd_api = spawn_cd_api(&cd_api_config, cd_state.clone()).await?;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "deploy" {
@@ -109,8 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let config = MuConDeConfig::from_file(config_path)?;
+        let repo = std::env::var("MUCONDE_REPO").ok();
         let outcome = orchestrator
-            .orchestrate_deployment(&config, artifact_sha256, None)
+            .orchestrate_deployment_for_repo(&config, artifact_sha256, None, repo.as_deref())
             .await?;
 
         match outcome {

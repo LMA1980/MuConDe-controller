@@ -245,6 +245,29 @@ impl LeaseCoordinator {
         leases.get(lease_id).map(|a| a.grant.clone())
     }
 
+    /// Snapshot of every tracked lease for the read-only CD API.
+    pub async fn list_leases(&self) -> Vec<crate::cd_state::LeaseView> {
+        let now = Self::current_epoch_ms();
+        let leases = self.leases.read().await;
+        let mut out: Vec<crate::cd_state::LeaseView> = leases
+            .values()
+            .map(|a| crate::cd_state::LeaseView {
+                lease_id: a.grant.lease_id.clone(),
+                deployment_id: a.grant.deployment_id.clone(),
+                target_node: a.grant.node_id.clone(),
+                service: a.service_name.clone(),
+                artifact_digest: a.artifact_sha256.clone(),
+                active_slot: a.grant.active_slot.into(),
+                candidate_slot: a.grant.candidate_slot.into(),
+                expires_epoch_ms: a.grant.expires_at_epoch_ms,
+                ttl_remaining_ms: a.grant.expires_at_epoch_ms.saturating_sub(now),
+                promoted: a.promoted,
+            })
+            .collect();
+        out.sort_by(|a, b| a.lease_id.cmp(&b.lease_id));
+        out
+    }
+
     /// Explicitly revoke an active lease, returning revocation and rollback commands.
     pub async fn revoke_lease(
         &self,
