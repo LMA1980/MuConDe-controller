@@ -129,6 +129,9 @@ pub enum OrchestratorError {
     #[error("MuRegist communication error: {0}")]
     Regist(String),
 
+    #[error("MuObserve SLO client error: {0}")]
+    Slo(String),
+
     #[error("Deployment timed out: {0}")]
     Timeout(String),
 

@@ -324,6 +324,9 @@ async fn test_end_to_end_full_success_promotes_on_mock_muregist() {
         target_nodes: vec!["worker-riscv64".into()],
         lease_ttl_seconds: 300,
         warmup_timeout_seconds: 30,
+        bake_window_seconds: 60,
+        max_error_logs: 0,
+        max_p99_latency_ms: 250.0,
         integration_tests: IntegrationTestSelector::All("all".into()),
     };
 
@@ -377,6 +380,9 @@ async fn test_end_to_end_it_failure_triggers_rollback_and_taints_mock_muregist()
         target_nodes: vec!["worker-riscv64".into()],
         lease_ttl_seconds: 300,
         warmup_timeout_seconds: 30,
+        bake_window_seconds: 60,
+        max_error_logs: 0,
+        max_p99_latency_ms: 250.0,
         integration_tests: IntegrationTestSelector::Selected(vec![
             "it_smoke".into(),
             "it_mtls".into(),
@@ -431,4 +437,123 @@ async fn test_end_to_end_it_failure_triggers_rollback_and_taints_mock_muregist()
     assert_eq!(agent.stage_calls.load(Ordering::SeqCst), 1);
 
     reg_handle.abort();
+}
+
+#[tokio::test]
+async fn test_end_to_end_muobserve_slo_gate_promote_and_breach_rollback_taint() {
+    use muconde_controller::slo::MuObserveSloClient;
+    use muobserve_ipc::{
+        decode_control_envelope, encode_control_envelope, read_frame, write_frame,
+        CanarySloAssertionResponse, ControlRpcEnvelope, IpcHeader, MSG_TYPE_FORY_CONTROL,
+    };
+
+    let reg_state = MockRegistryState::default();
+    let (reg_addr, reg_handle) = start_mock_regist_server(reg_state.clone()).await;
+    let reg_url = format!("http://{}", reg_addr);
+
+    // Start a live MUOB Fory RPC mock MuObserve server that approves "sha256-canary-slo-ok"
+    // and rejects "sha256-canary-slo-breach" with taint_recommended = true.
+    let observe_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind observe");
+    let observe_addr = observe_listener.local_addr().expect("observe local_addr");
+    let observe_handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = observe_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let (hdr, payload) = read_frame(&mut stream).await.expect("read slo req");
+                assert_eq!(hdr.msg_type, MSG_TYPE_FORY_CONTROL);
+                let env = decode_control_envelope(&payload).expect("decode slo req");
+                if let ControlRpcEnvelope::CanarySloReq(req) = env {
+                    let is_ok = req.candidate_digest == "sha256-canary-slo-ok";
+                    let resp = if is_ok {
+                        CanarySloAssertionResponse {
+                            request_id: req.request_id,
+                            healthy: true,
+                            error_log_count: 0,
+                            p99_latency_ms: 19.5,
+                            taint_recommended: false,
+                            reason: "SLO healthy".to_string(),
+                        }
+                    } else {
+                        CanarySloAssertionResponse {
+                            request_id: req.request_id,
+                            healthy: false,
+                            error_log_count: 7,
+                            p99_latency_ms: 615.0,
+                            taint_recommended: true,
+                            reason: "p99 latency 615.0ms > 250.0ms and 7 error logs".to_string(),
+                        }
+                    };
+                    let bytes = encode_control_envelope(&ControlRpcEnvelope::CanarySloResp(resp))
+                        .expect("encode slo resp");
+                    let resp_hdr =
+                        IpcHeader::new(MSG_TYPE_FORY_CONTROL, bytes.len() as u32, 0, hdr.sequence);
+                    write_frame(&mut stream, &resp_hdr, &bytes)
+                        .await
+                        .expect("write slo resp");
+                }
+            });
+        }
+    });
+
+    let coordinator = Arc::new(LeaseCoordinator::new());
+    let agent = Arc::new(TestAgentClient {
+        stage_ok: AtomicBool::new(true),
+        it_passed: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let regist_client = Arc::new(HttpMuRegistClient::with_client(
+        &reg_url,
+        reqwest::Client::new(),
+        Some("test-bearer-token".into()),
+    ));
+    let slo_client = Arc::new(MuObserveSloClient::new_plaintext(observe_addr.to_string()));
+
+    let orchestrator =
+        DeploymentOrchestrator::new(coordinator.clone(), None, agent.clone(), regist_client)
+            .with_slo_client(slo_client);
+
+    let config = MuConDeConfig {
+        version: "1".into(),
+        service: "action-runner".into(),
+        target_nodes: vec!["worker-riscv64".into()],
+        lease_ttl_seconds: 300,
+        warmup_timeout_seconds: 30,
+        bake_window_seconds: 60,
+        max_error_logs: 0,
+        max_p99_latency_ms: 250.0,
+        integration_tests: IntegrationTestSelector::All("all".into()),
+    };
+
+    // Case 1: Healthy SLO -> Promoted
+    let ok_digest = "sha256-canary-slo-ok";
+    let ok_outcome = orchestrator
+        .orchestrate_deployment(&config, ok_digest, Some("dep-slo-ok".into()))
+        .await
+        .expect("ok deployment");
+    assert!(ok_outcome.is_promoted());
+    assert_eq!(reg_state.promote_invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(reg_state.taint_invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 0);
+
+    // Case 2: Breached SLO -> Automatic Rollback + MuRegist Taint
+    let bad_digest = "sha256-canary-slo-breach";
+    let bad_outcome = orchestrator
+        .orchestrate_deployment(&config, bad_digest, Some("dep-slo-breach".into()))
+        .await
+        .expect("breach deployment returns outcome");
+    assert!(bad_outcome.is_rolled_back());
+    assert_eq!(agent.rollback_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reg_state.promote_invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(reg_state.taint_invocations.load(Ordering::SeqCst), 1);
+
+    let taints = reg_state.tainted_digests.lock().await;
+    assert!(taints.contains(bad_digest));
+    drop(taints);
+
+    reg_handle.abort();
+    observe_handle.abort();
 }
