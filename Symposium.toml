@@ -1,0 +1,10 @@
+name = "muconde-controller"
+# Crate-embedded Symposium manifest for muconde-controller.
+
+[[plugins]]
+depends-on = ["muconde-ipc"]
+source.cargo = "muconde-ipc"
+
+[[plugins]]
+depends-on = ["muobserve-ipc"]
+source.cargo = "muobserve-ipc"
