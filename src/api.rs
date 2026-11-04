@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path as AxPath, Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -150,6 +150,27 @@ async fn require_bearer(State(state): State<CdApiState>, req: Request, next: Nex
         Some(p) if bool::from(p.as_bytes().ct_eq(expected.as_bytes())) => next.run(req).await,
         _ => unauthorized(),
     }
+}
+
+/// Returns `true` when the reverse proxy has verified an invited GitHub operator session.
+///
+/// Public read-only dashboard requests carry the reverse-proxy CD bearer token without an
+/// operator header; those requests receive full gate checkpoint state (`tests[].name`,
+/// `critical`, `state`, `duration_ms`) with `tests[].log_excerpt` redacted to `None`.
+pub fn is_operator_authenticated(headers: &HeaderMap) -> bool {
+    let op_auth = headers
+        .get("x-operator-authenticated")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+    if op_auth {
+        return true;
+    }
+    headers
+        .get("x-forwarded-user")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty())
 }
 
 /// `GET /api/cd/deployments` entry (newest first).
@@ -317,10 +338,22 @@ async fn get_deployments(
     Json(out)
 }
 
-async fn get_gate(State(state): State<CdApiState>, AxPath(id): AxPath<String>) -> Response {
+async fn get_gate(
+    State(state): State<CdApiState>,
+    headers: HeaderMap,
+    AxPath(id): AxPath<String>,
+) -> Response {
     let snap = state.store.snapshot();
     match snap.deployment(&id) {
-        Some(d) => Json(DeploymentGate::from_record(d, now_epoch_ms())).into_response(),
+        Some(d) => {
+            let mut gate = DeploymentGate::from_record(d, now_epoch_ms());
+            if !is_operator_authenticated(&headers) {
+                for test in &mut gate.tests {
+                    test.log_excerpt = None;
+                }
+            }
+            Json(gate).into_response()
+        }
         None => (
             StatusCode::NOT_FOUND,
             Json(ErrorBody {
@@ -454,5 +487,30 @@ mod tests {
         let c = CdApiConfig::default();
         assert!(c.bind_addr.is_none());
         assert!(c.token_file.is_none());
+    }
+
+    #[test]
+    fn test_is_operator_authenticated_headers() {
+        let mut h = HeaderMap::new();
+        assert!(!is_operator_authenticated(&h));
+
+        h.insert(
+            "x-operator-authenticated",
+            HeaderValue::from_static("false"),
+        );
+        assert!(!is_operator_authenticated(&h));
+
+        h.insert("x-operator-authenticated", HeaderValue::from_static("TRUE"));
+        assert!(is_operator_authenticated(&h));
+
+        h.insert("x-operator-authenticated", HeaderValue::from_static("1"));
+        assert!(is_operator_authenticated(&h));
+
+        h.remove("x-operator-authenticated");
+        h.insert("x-forwarded-user", HeaderValue::from_static("   "));
+        assert!(!is_operator_authenticated(&h));
+
+        h.insert("x-forwarded-user", HeaderValue::from_static("octocat"));
+        assert!(is_operator_authenticated(&h));
     }
 }

@@ -1150,6 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_orchestrator_full_success_path() {
         let coordinator = Arc::new(LeaseCoordinator::new());
         let agent = Arc::new(MockAgentClient {
@@ -1184,6 +1185,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_orchestrator_it_failure_triggers_rollback_and_taint() {
         let coordinator = Arc::new(LeaseCoordinator::new());
         let agent = Arc::new(MockAgentClient {
@@ -1234,6 +1236,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_orchestrator_slo_healthy_promotes_canary() {
         let coordinator = Arc::new(LeaseCoordinator::new());
         let agent = Arc::new(MockAgentClient {
@@ -1265,6 +1268,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_orchestrator_slo_breach_triggers_rollback_and_taint() {
         let coordinator = Arc::new(LeaseCoordinator::new());
         let agent = Arc::new(MockAgentClient {

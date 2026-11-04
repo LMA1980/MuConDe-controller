@@ -68,6 +68,16 @@ fn seeded_store() -> Arc<CdStateStore> {
         vec![("smoke", true), ("perf", false)],
     ));
     store.apply_it_progress(&progress("dep-old", "smoke", true, TestState::Failed));
+    store.apply_it_report(&IntegrationTestReport {
+        deployment_id: "dep-old".into(),
+        service_name: "example-svc".into(),
+        artifact_sha256: "sha256:dep-old".into(),
+        executed_tests: vec!["smoke".into(), "perf".into()],
+        passed: false,
+        failed_tests: vec!["smoke".into()],
+        duration_ms: 42,
+        log_excerpt: Some("assertion failed: smoke probe returned 503".into()),
+    });
     store.deployment_rolled_back(
         "dep-old",
         Slot::A,
@@ -105,9 +115,21 @@ async fn get(
     uri: &str,
     auth: Option<&str>,
 ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    get_with_headers(app, uri, auth, &[]).await
+}
+
+async fn get_with_headers(
+    app: axum::Router,
+    uri: &str,
+    auth: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     let mut req = Request::builder().uri(uri);
     if let Some(a) = auth {
         req = req.header(header::AUTHORIZATION, a);
+    }
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
     }
     let resp = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
     let status = resp.status();
@@ -315,6 +337,80 @@ async fn test_gate_endpoint_shape() {
         serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"],
         "deployment_not_found"
     );
+}
+
+#[tokio::test]
+async fn test_gate_redacts_log_excerpt_unless_operator_authenticated() {
+    let app = router(CdApiState::new(seeded_store(), Some(TOKEN.into())));
+
+    // 1. Public read-only dashboard request (valid bearer token, no operator header):
+    // checkpoint states and durations are intact, but log_excerpt is redacted to None.
+    let (s, _, body) = get(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        Some(&bearer()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let anon_gate: DeploymentGate = serde_json::from_slice(&body).unwrap();
+    assert_eq!(anon_gate.outcome, GateOutcome::RolledBack);
+    assert_eq!(anon_gate.tests.len(), 2);
+    assert_eq!(anon_gate.tests[0].name, "smoke");
+    assert_eq!(anon_gate.tests[0].state, TestState::Failed);
+    assert_eq!(anon_gate.tests[0].duration_ms, 42);
+    assert!(
+        anon_gate.tests.iter().all(|t| t.log_excerpt.is_none()),
+        "anonymous public requests must redact log_excerpt"
+    );
+
+    // 2. Operator-authenticated request via X-Forwarded-User preserves log_excerpt.
+    let (s, _, body) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        Some(&bearer()),
+        &[("x-forwarded-user", "octocat")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let op_gate: DeploymentGate = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        op_gate.tests[0].log_excerpt.as_deref(),
+        Some("assertion failed: smoke probe returned 503")
+    );
+
+    // 3. Operator-authenticated request via X-Operator-Authenticated: true preserves log_excerpt.
+    let (s, _, body) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        Some(&bearer()),
+        &[("x-operator-authenticated", "true")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let op_gate_flag: DeploymentGate = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        op_gate_flag.tests[0].log_excerpt.as_deref(),
+        Some("assertion failed: smoke probe returned 503")
+    );
+
+    // 4. Missing or invalid bearer token still fails closed with 401 even when X-Forwarded-User is sent.
+    let (s, _, _) = get_with_headers(
+        app.clone(),
+        "/api/cd/deployments/dep-old/gate",
+        None,
+        &[("x-forwarded-user", "octocat")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+
+    let (s, _, _) = get_with_headers(
+        app,
+        "/api/cd/deployments/dep-old/gate",
+        Some("Bearer invalid-token"),
+        &[("x-forwarded-user", "octocat")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

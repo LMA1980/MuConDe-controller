@@ -435,6 +435,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_lease_coordinator_acquire_and_prevent_overlap() {
         let coordinator = LeaseCoordinator::new();
 
@@ -484,6 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_lease_auto_expires_and_emits_revoke_and_rollback() {
         let coordinator = Arc::new(LeaseCoordinator::new());
 
@@ -523,6 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_promoted_lease_is_not_rolled_back_on_expiration() {
         let coordinator = Arc::new(LeaseCoordinator::new());
 

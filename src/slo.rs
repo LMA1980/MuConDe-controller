@@ -209,6 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(miri, ignore)]
     async fn test_muobserve_slo_client_mtls_roundtrip() {
         let (client_tls, server_tls) = generate_mtls_materials();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
